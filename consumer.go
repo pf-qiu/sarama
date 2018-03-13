@@ -64,6 +64,7 @@ type Consumer interface {
 	// on the given topic/partition. Offset can be a literal offset, or OffsetNewest
 	// or OffsetOldest
 	ConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error)
+	BatchConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error)
 
 	// HighWaterMarks returns the current high water marks for each topic and partition.
 	// Consistency between partitions is not guaranteed since high water marks are updated separately.
@@ -132,6 +133,44 @@ func (c *consumer) Partitions(topic string) ([]int32, error) {
 	return c.client.Partitions(topic)
 }
 
+func (c *consumer) BatchConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error) {
+	child := &partitionConsumer{
+		consumer:      c,
+		conf:          c.conf,
+		topic:         topic,
+		partition:     partition,
+		batchMessages: make(chan []*ConsumerMessage, c.conf.ChannelBufferSize),
+		errors:        make(chan *ConsumerError, c.conf.ChannelBufferSize),
+		feeder:        make(chan *FetchResponse, 1),
+		trigger:       make(chan none, 1),
+		dying:         make(chan none),
+		fetchSize:     c.conf.Consumer.Fetch.Default,
+		batchMode:     true,
+	}
+
+	if err := child.chooseStartingOffset(offset); err != nil {
+		return nil, err
+	}
+
+	var leader *Broker
+	var err error
+	if leader, err = c.client.Leader(child.topic, child.partition); err != nil {
+		return nil, err
+	}
+
+	if err := c.addChild(child); err != nil {
+		return nil, err
+	}
+
+	go withRecover(child.dispatcher)
+	go withRecover(child.responseFeeder)
+
+	child.broker = c.refBrokerConsumer(leader)
+	child.broker.input <- child
+
+	return child, nil
+}
+
 func (c *consumer) ConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error) {
 	child := &partitionConsumer{
 		consumer:  c,
@@ -144,6 +183,7 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 		trigger:   make(chan none, 1),
 		dying:     make(chan none),
 		fetchSize: c.conf.Consumer.Fetch.Default,
+		batchMode: false,
 	}
 
 	if err := child.chooseStartingOffset(offset); err != nil {
@@ -284,6 +324,8 @@ type PartitionConsumer interface {
 	// the broker.
 	Messages() <-chan *ConsumerMessage
 
+	BatchMessages() <-chan []*ConsumerMessage
+
 	// Errors returns a read channel of errors that occurred during consuming, if
 	// enabled. By default, errors are logged and not returned over this channel.
 	// If you want to implement any custom error handling, set your config's
@@ -303,16 +345,19 @@ type partitionConsumer struct {
 	topic               string
 	partition           int32
 
-	broker   *brokerConsumer
-	messages chan *ConsumerMessage
-	errors   chan *ConsumerError
-	feeder   chan *FetchResponse
+	broker        *brokerConsumer
+	messages      chan *ConsumerMessage
+	batchMessages chan []*ConsumerMessage
+	errors        chan *ConsumerError
+	feeder        chan *FetchResponse
 
 	trigger, dying chan none
 	responseResult error
 
 	fetchSize int32
 	offset    int64
+
+	batchMode bool
 }
 
 var errTimedOut = errors.New("timed out feeding messages to the user") // not user-facing
@@ -400,7 +445,17 @@ func (child *partitionConsumer) chooseStartingOffset(offset int64) error {
 }
 
 func (child *partitionConsumer) Messages() <-chan *ConsumerMessage {
+	if child.batchMode {
+		panic("Batch mode")
+	}
 	return child.messages
+}
+
+func (child *partitionConsumer) BatchMessages() <-chan []*ConsumerMessage {
+	if !child.batchMode {
+		panic("Non batch mode")
+	}
+	return child.batchMessages
 }
 
 func (child *partitionConsumer) Errors() <-chan *ConsumerError {
@@ -418,11 +473,19 @@ func (child *partitionConsumer) AsyncClose() {
 func (child *partitionConsumer) Close() error {
 	child.AsyncClose()
 
-	go withRecover(func() {
-		for range child.messages {
-			// drain
-		}
-	})
+	if child.batchMode {
+		go withRecover(func() {
+			for range child.batchMessages {
+
+			}
+		})
+	} else {
+		go withRecover(func() {
+			for range child.messages {
+				// drain
+			}
+		})
+	}
 
 	var errors ConsumerErrors
 	for err := range child.errors {
@@ -448,34 +511,50 @@ feederLoop:
 	for response := range child.feeder {
 		msgs, child.responseResult = child.parseResponse(response)
 
-		for i, msg := range msgs {
-		messageSelect:
+		if child.batchMode {
 			select {
-			case child.messages <- msg:
-				firstAttempt = true
+			case child.batchMessages <- msgs:
 			case <-expiryTicker.C:
-				if !firstAttempt {
-					child.responseResult = errTimedOut
-					child.broker.acks.Done()
-					for _, msg = range msgs[i:] {
-						child.messages <- msg
+				child.responseResult = errTimedOut
+				child.broker.acks.Done()
+				child.batchMessages <- msgs
+				child.broker.input <- child
+				continue feederLoop
+			}
+		} else {
+
+			for i, msg := range msgs {
+			messageSelect:
+				select {
+				case child.messages <- msg:
+					firstAttempt = true
+				case <-expiryTicker.C:
+					if !firstAttempt {
+						child.responseResult = errTimedOut
+						child.broker.acks.Done()
+						for _, msg = range msgs[i:] {
+							child.messages <- msg
+						}
+						child.broker.input <- child
+						continue feederLoop
+					} else {
+						// current message has not been sent, return to select
+						// statement
+						firstAttempt = false
+						goto messageSelect
 					}
-					child.broker.input <- child
-					continue feederLoop
-				} else {
-					// current message has not been sent, return to select
-					// statement
-					firstAttempt = false
-					goto messageSelect
 				}
 			}
 		}
-
 		child.broker.acks.Done()
 	}
 
 	expiryTicker.Stop()
-	close(child.messages)
+	if child.batchMode {
+		close(child.batchMessages)
+	} else {
+		close(child.messages)
+	}
 	close(child.errors)
 }
 
