@@ -146,6 +146,7 @@ func (c *consumer) BatchConsumePartition(topic string, partition int32, offset i
 		dying:         make(chan none),
 		fetchSize:     c.conf.Consumer.Fetch.Default,
 		batchMode:     true,
+		messageBuffer: []*ConsumerMessage{},
 	}
 
 	if err := child.chooseStartingOffset(offset); err != nil {
@@ -358,6 +359,8 @@ type partitionConsumer struct {
 	offset    int64
 
 	batchMode bool
+
+	messageBuffer []*ConsumerMessage
 }
 
 var errTimedOut = errors.New("timed out feeding messages to the user") // not user-facing
@@ -559,7 +562,7 @@ feederLoop:
 }
 
 func (child *partitionConsumer) parseMessages(msgSet *MessageSet) ([]*ConsumerMessage, error) {
-	var messages []*ConsumerMessage
+	i := 0
 	for _, msgBlock := range msgSet.Messages {
 		for _, msg := range msgBlock.Messages() {
 			offset := msg.Offset
@@ -570,22 +573,34 @@ func (child *partitionConsumer) parseMessages(msgSet *MessageSet) ([]*ConsumerMe
 			if offset < child.offset {
 				continue
 			}
-			messages = append(messages, &ConsumerMessage{
-				Topic:          child.topic,
-				Partition:      child.partition,
-				Key:            msg.Msg.Key,
-				Value:          msg.Msg.Value,
-				Offset:         offset,
-				Timestamp:      msg.Msg.Timestamp,
-				BlockTimestamp: msgBlock.Msg.Timestamp,
-			})
+			if i < len(child.messageBuffer) {
+				m := child.messageBuffer[i]
+				m.Topic = child.topic
+				m.Partition = child.partition
+				m.Key = msg.Msg.Key
+				m.Value = msg.Msg.Value
+				m.Offset = offset
+				m.Timestamp = msg.Msg.Timestamp
+				m.BlockTimestamp = msgBlock.Msg.Timestamp
+			} else {
+				child.messageBuffer = append(child.messageBuffer, &ConsumerMessage{
+					Topic:          child.topic,
+					Partition:      child.partition,
+					Key:            msg.Msg.Key,
+					Value:          msg.Msg.Value,
+					Offset:         offset,
+					Timestamp:      msg.Msg.Timestamp,
+					BlockTimestamp: msgBlock.Msg.Timestamp,
+				})
+			}
+			i++
 			child.offset = offset + 1
 		}
 	}
-	if len(messages) == 0 {
+	if i == 0 {
 		return nil, ErrIncompleteResponse
 	}
-	return messages, nil
+	return child.messageBuffer[:i], nil
 }
 
 func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMessage, error) {
