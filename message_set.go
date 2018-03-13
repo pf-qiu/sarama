@@ -24,12 +24,12 @@ func (msb *MessageBlock) encode(pe packetEncoder) error {
 	return pe.pop()
 }
 
-func (msb *MessageBlock) decode(pd packetDecoder) (err error) {
+func (msb *MessageBlock) decode(pd packetDecoder, lengthFd pushDecoder) (err error) {
 	if msb.Offset, err = pd.getInt64(); err != nil {
 		return err
 	}
 
-	if err = pd.push(&lengthField{}); err != nil {
+	if err = pd.push(lengthFd); err != nil {
 		return err
 	}
 
@@ -62,7 +62,7 @@ func (ms *MessageSet) encode(pe packetEncoder) error {
 
 func (ms *MessageSet) decode(pd packetDecoder) (err error) {
 	ms.Messages = nil
-
+	lfd := lengthField{}
 	for pd.remaining() > 0 {
 		magic, err := magicValue(pd)
 		if err != nil {
@@ -78,7 +78,8 @@ func (ms *MessageSet) decode(pd packetDecoder) (err error) {
 		}
 
 		msb := new(MessageBlock)
-		err = msb.decode(pd)
+		lfd.startOffset = 0
+		err = msb.decode(pd, &lfd)
 		switch err {
 		case nil:
 			ms.Messages = append(ms.Messages, msb)
