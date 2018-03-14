@@ -139,7 +139,7 @@ func (c *consumer) BatchConsumePartition(topic string, partition int32, offset i
 		conf:          c.conf,
 		topic:         topic,
 		partition:     partition,
-		batchMessages: make(chan []*ConsumerMessage, c.conf.ChannelBufferSize),
+		batchMessages: make(chan [][]byte, c.conf.ChannelBufferSize),
 		errors:        make(chan *ConsumerError, c.conf.ChannelBufferSize),
 		feeder:        make(chan *FetchResponse, 1),
 		trigger:       make(chan none, 1),
@@ -325,7 +325,7 @@ type PartitionConsumer interface {
 	// the broker.
 	Messages() <-chan *ConsumerMessage
 
-	BatchMessages() <-chan []*ConsumerMessage
+	BatchMessages() <-chan [][]byte
 
 	// Errors returns a read channel of errors that occurred during consuming, if
 	// enabled. By default, errors are logged and not returned over this channel.
@@ -348,7 +348,7 @@ type partitionConsumer struct {
 
 	broker        *brokerConsumer
 	messages      chan *ConsumerMessage
-	batchMessages chan []*ConsumerMessage
+	batchMessages chan [][]byte
 	errors        chan *ConsumerError
 	feeder        chan *FetchResponse
 
@@ -454,7 +454,7 @@ func (child *partitionConsumer) Messages() <-chan *ConsumerMessage {
 	return child.messages
 }
 
-func (child *partitionConsumer) BatchMessages() <-chan []*ConsumerMessage {
+func (child *partitionConsumer) BatchMessages() <-chan [][]byte {
 	if !child.batchMode {
 		panic("Non batch mode")
 	}
@@ -515,12 +515,16 @@ feederLoop:
 		msgs, child.responseResult = child.parseResponse(response)
 
 		if child.batchMode {
+			data := make([][]byte, len(msgs))
+			for i, m := range msgs {
+				data[i] = m.Value
+			}
 			select {
-			case child.batchMessages <- msgs:
+			case child.batchMessages <- data:
 			case <-expiryTicker.C:
 				child.responseResult = errTimedOut
 				child.broker.acks.Done()
-				child.batchMessages <- msgs
+				child.batchMessages <- data
 				child.broker.input <- child
 				continue feederLoop
 			}
