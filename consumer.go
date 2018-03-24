@@ -40,6 +40,9 @@ func (ce ConsumerErrors) Error() string {
 	return fmt.Sprintf("kafka: %d errors while consuming", len(ce))
 }
 
+type LegacyCallback func([]*MessageBlock, interface{})
+type RecordCallback func([]*Record, interface{})
+
 // Consumer manages PartitionConsumers which process Kafka messages from brokers. You MUST call Close()
 // on a consumer to avoid leaks, it will not be garbage-collected automatically when it passes out of
 // scope.
@@ -65,6 +68,8 @@ type Consumer interface {
 	// or OffsetOldest
 	ConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error)
 
+	ConsumePartitionByCallback(topic string, partition int32, offset int64,
+		legacyCb LegacyCallback, recordCb RecordCallback, userctx interface{}) (PartitionConsumer, error)
 	// HighWaterMarks returns the current high water marks for each topic and partition.
 	// Consistency between partitions is not guaranteed since high water marks are updated separately.
 	HighWaterMarks() map[string]map[int32]int64
@@ -130,6 +135,49 @@ func (c *consumer) Topics() ([]string, error) {
 
 func (c *consumer) Partitions(topic string) ([]int32, error) {
 	return c.client.Partitions(topic)
+}
+
+func (c *consumer) ConsumePartitionByCallback(
+	topic string, partition int32, offset int64,
+	legacyCb LegacyCallback, recordCb RecordCallback,
+	userctx interface{}) (PartitionConsumer, error) {
+	child := &partitionConsumer{
+		consumer:       c,
+		conf:           c.conf,
+		topic:          topic,
+		partition:      partition,
+		messages:       make(chan *ConsumerMessage, c.conf.ChannelBufferSize),
+		errors:         make(chan *ConsumerError, c.conf.ChannelBufferSize),
+		feeder:         make(chan *FetchResponse, 1),
+		trigger:        make(chan none, 1),
+		dying:          make(chan none),
+		fetchSize:      c.conf.Consumer.Fetch.Default,
+		legacyCallback: legacyCb,
+		recordCallback: recordCb,
+		userctx:        userctx,
+	}
+
+	if err := child.chooseStartingOffset(offset); err != nil {
+		return nil, err
+	}
+
+	var leader *Broker
+	var err error
+	if leader, err = c.client.Leader(child.topic, child.partition); err != nil {
+		return nil, err
+	}
+
+	if err := c.addChild(child); err != nil {
+		return nil, err
+	}
+
+	go withRecover(child.dispatcher)
+	go withRecover(child.responseFeeder)
+
+	child.broker = c.refBrokerConsumer(leader)
+	child.broker.input <- child
+
+	return child, nil
 }
 
 func (c *consumer) ConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error) {
@@ -313,6 +361,10 @@ type partitionConsumer struct {
 
 	fetchSize int32
 	offset    int64
+
+	legacyCallback LegacyCallback
+	recordCallback RecordCallback
+	userctx        interface{}
 }
 
 var errTimedOut = errors.New("timed out feeding messages to the user") // not user-facing
@@ -574,6 +626,28 @@ func (child *partitionConsumer) parseResponse(response *FetchResponse) ([]*Consu
 	child.fetchSize = child.conf.Consumer.Fetch.Default
 	atomic.StoreInt64(&child.highWaterMarkOffset, block.HighWaterMarkOffset)
 
+	if child.legacyCallback != nil && child.recordCallback != nil {
+		for _, records := range block.RecordsSet {
+			if control, err := records.isControl(); err != nil || control {
+				continue
+			}
+			switch records.recordsType {
+			case legacyRecords:
+				child.legacyCallback(records.MsgSet.Messages, child.userctx)
+				var offset int64
+				offset = child.offset
+				for _, msg := range records.MsgSet.Messages {
+					if msg.Offset > offset {
+						offset = msg.Offset
+					}
+				}
+				child.offset = offset + 1
+			case defaultRecords:
+				child.recordCallback(records.RecordBatch.Records, child.userctx)
+			}
+		}
+		return []*ConsumerMessage{}, nil
+	}
 	messages := []*ConsumerMessage{}
 	for _, records := range block.RecordsSet {
 		if control, err := records.isControl(); err != nil || control {
