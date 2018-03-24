@@ -31,6 +31,14 @@ func (rd *realDecoder) getInt8() (int8, error) {
 	return tmp, nil
 }
 
+func (rd *realDecoder) getInt8At(offset int) (int8, error) {
+	if len(rd.raw)-offset < 1 {
+		return -1, ErrInsufficientData
+	}
+	tmp := int8(rd.raw[offset])
+	return tmp, nil
+}
+
 func (rd *realDecoder) getInt16() (int16, error) {
 	if rd.remaining() < 2 {
 		rd.off = len(rd.raw)

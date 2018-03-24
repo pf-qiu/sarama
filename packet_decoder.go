@@ -6,6 +6,7 @@ package sarama
 type packetDecoder interface {
 	// Primitives
 	getInt8() (int8, error)
+	getInt8At(int) (int8, error)
 	getInt16() (int16, error)
 	getInt32() (int32, error)
 	getInt64() (int64, error)

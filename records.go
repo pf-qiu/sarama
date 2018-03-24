@@ -164,10 +164,5 @@ func (r *Records) isControl() (bool, error) {
 }
 
 func magicValue(pd packetDecoder) (int8, error) {
-	dec, err := pd.peek(magicOffset, magicLength)
-	if err != nil {
-		return 0, err
-	}
-
-	return dec.getInt8()
+	return pd.getInt8At(magicOffset)
 }
